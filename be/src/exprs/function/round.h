@@ -39,6 +39,8 @@
 #include <fenv.h>
 #endif
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <type_traits>
 
 #include "core/call_on_type_index.h"
@@ -46,6 +48,7 @@
 #include "core/column/column_decimal.h"
 #include "core/data_type/data_type_decimal.h"
 #include "core/data_type/data_type_number.h"
+#include "exprs/function/pow10_table.h"
 
 namespace doris {
 #include "common/compile_check_avoid_begin.h"
@@ -464,6 +467,102 @@ public:
     }
 };
 
+template <typename ValueType, RoundingMode rounding_mode, TieBreakingMode tie_breaking_mode>
+struct FloatLargeScaleContext {
+    Int32 scale_arg;
+
+    explicit FloatLargeScaleContext(Int32 scale) : scale_arg(scale) {}
+
+    ValueType apply(ValueType value) const {
+        const double input = static_cast<double>(value);
+        if (!std::isfinite(input) || input == 0.0) {
+            return value;
+        }
+
+        if (scale_arg > 19) {
+            if (scale_arg > 324) {
+                return value;
+            }
+            double q = 0.0;
+            if (scale_arg <= 308) {
+                const auto& p = POW10_TABLE[scale_arg];
+                q = input * p.hi + input * p.lo;
+            } else {
+                const auto& p1 = POW10_TABLE[300];
+                const auto& p2 = POW10_TABLE[scale_arg - 300];
+                double mid = input * p1.hi;
+                q = mid * p2.hi;
+            }
+
+            if (q == 0.0) {
+                if constexpr (rounding_mode == RoundingMode::Ceil) {
+                    return input > 0 ? static_cast<ValueType>(
+                                               1.0 / POW10_TABLE[std::min(scale_arg, 308)].hi)
+                                     : std::copysign(ValueType {0}, value);
+                } else if constexpr (rounding_mode == RoundingMode::Floor) {
+                    return input < 0 ? static_cast<ValueType>(
+                                               -1.0 / POW10_TABLE[std::min(scale_arg, 308)].hi)
+                                     : std::copysign(ValueType {0}, value);
+                } else {
+                    return std::copysign(ValueType {0}, value);
+                }
+            }
+
+            const double rounded = roundWithMode<tie_breaking_mode>(q, rounding_mode);
+            if (rounded == 0.0) {
+                return std::copysign(ValueType {0}, value);
+            }
+
+            if (scale_arg <= 308) {
+                const auto& p = POW10_TABLE[scale_arg];
+                return static_cast<ValueType>(rounded / p.hi);
+            } else {
+                const auto& p1 = POW10_TABLE[300];
+                const auto& p2 = POW10_TABLE[scale_arg - 300];
+                return static_cast<ValueType>((rounded / p2.hi) / p1.hi);
+            }
+        }
+
+        // Negative scale: scale_arg < -19
+        const Int32 k = -scale_arg;
+        if (k > 308) {
+            if constexpr (rounding_mode == RoundingMode::Floor) {
+                return input < 0 ? -std::numeric_limits<ValueType>::infinity()
+                                 : std::copysign(ValueType {0}, value);
+            } else if constexpr (rounding_mode == RoundingMode::Ceil) {
+                return input > 0 ? std::numeric_limits<ValueType>::infinity()
+                                 : std::copysign(ValueType {0}, value);
+            } else {
+                return std::copysign(ValueType {0}, value);
+            }
+        }
+
+        const auto& p = POW10_TABLE[k];
+        double q0 = input / p.hi;
+        double rem = input - q0 * p.hi - q0 * p.lo;
+        double q1 = rem / p.hi;
+        double q = q0 + q1;
+
+        if (q == 0.0) {
+            if constexpr (rounding_mode == RoundingMode::Ceil) {
+                return input > 0 ? static_cast<ValueType>(p.hi)
+                                 : std::copysign(ValueType {0}, value);
+            } else if constexpr (rounding_mode == RoundingMode::Floor) {
+                return input < 0 ? static_cast<ValueType>(-p.hi)
+                                 : std::copysign(ValueType {0}, value);
+            } else {
+                return std::copysign(ValueType {0}, value);
+            }
+        }
+
+        const double rounded = roundWithMode<tie_breaking_mode>(q, rounding_mode);
+        if (rounded == 0.0) {
+            return std::copysign(ValueType {0}, value);
+        }
+        return static_cast<ValueType>(rounded * p.hi + rounded * p.lo);
+    }
+};
+
 /** Select the appropriate processing algorithm depending on the scale.
   */
 template <PrimitiveType T, RoundingMode rounding_mode, TieBreakingMode tie_breaking_mode>
@@ -475,6 +574,14 @@ struct Dispatcher {
                     is_float_or_double(T) || T == TYPE_TIMEV2,
                     FloatRoundingImpl<T, rounding_mode, scale_mode, tie_breaking_mode>,
                     IntegerRoundingImpl<T, rounding_mode, scale_mode, tie_breaking_mode>>>;
+
+    using LargeScaleContext = FloatLargeScaleContext<typename PrimitiveTypeTraits<T>::CppType,
+                                                     rounding_mode, tie_breaking_mode>;
+
+    static typename PrimitiveTypeTraits<T>::CppType apply_float_rounding_with_large_scale(
+            typename PrimitiveTypeTraits<T>::CppType value, Int32 scale_arg) {
+        return LargeScaleContext(scale_arg).apply(value);
+    }
 
     // scale_arg: scale for function computation
     // result_scale: scale for result decimal, this scale is got from planner
@@ -493,13 +600,39 @@ struct Dispatcher {
                     size_t scale = 1;
                     FunctionRoundingImpl<ScaleMode::Zero>::apply(col->get_data(), scale, vec_res);
                 } else if (scale_arg > 0) {
-                    size_t scale = int_exp10(scale_arg);
-                    FunctionRoundingImpl<ScaleMode::Positive>::apply(col->get_data(), scale,
-                                                                     vec_res);
+                    if constexpr (is_float_or_double(T)) {
+                        if (scale_arg > 19) {
+                            LargeScaleContext ctx(scale_arg);
+                            for (size_t i = 0; i < vec_res.size(); ++i) {
+                                vec_res[i] = ctx.apply(col->get_data()[i]);
+                            }
+                        } else {
+                            size_t scale = int_exp10(scale_arg);
+                            FunctionRoundingImpl<ScaleMode::Positive>::apply(col->get_data(), scale,
+                                                                             vec_res);
+                        }
+                    } else {
+                        size_t scale = int_exp10(scale_arg);
+                        FunctionRoundingImpl<ScaleMode::Positive>::apply(col->get_data(), scale,
+                                                                         vec_res);
+                    }
                 } else {
-                    size_t scale = int_exp10(-scale_arg);
-                    FunctionRoundingImpl<ScaleMode::Negative>::apply(col->get_data(), scale,
-                                                                     vec_res);
+                    if constexpr (is_float_or_double(T)) {
+                        if (scale_arg < -19) {
+                            LargeScaleContext ctx(scale_arg);
+                            for (size_t i = 0; i < vec_res.size(); ++i) {
+                                vec_res[i] = ctx.apply(col->get_data()[i]);
+                            }
+                        } else {
+                            size_t scale = int_exp10(-scale_arg);
+                            FunctionRoundingImpl<ScaleMode::Negative>::apply(col->get_data(), scale,
+                                                                             vec_res);
+                        }
+                    } else {
+                        size_t scale = int_exp10(-scale_arg);
+                        FunctionRoundingImpl<ScaleMode::Negative>::apply(col->get_data(), scale,
+                                                                         vec_res);
+                    }
                 }
             }
 
@@ -564,13 +697,35 @@ struct Dispatcher {
                     FunctionRoundingImpl<ScaleMode::Zero>::apply(col->get_data()[i], scale,
                                                                  vec_res[i]);
                 } else if (scale_arg > 0) {
-                    size_t scale = int_exp10(scale_arg);
-                    FunctionRoundingImpl<ScaleMode::Positive>::apply(col->get_data()[i], scale,
-                                                                     vec_res[i]);
+                    if constexpr (is_float_or_double(T)) {
+                        if (scale_arg > 19) {
+                            vec_res[i] = apply_float_rounding_with_large_scale(col->get_data()[i],
+                                                                               scale_arg);
+                        } else {
+                            size_t scale = int_exp10(scale_arg);
+                            FunctionRoundingImpl<ScaleMode::Positive>::apply(col->get_data()[i],
+                                                                             scale, vec_res[i]);
+                        }
+                    } else {
+                        size_t scale = int_exp10(scale_arg);
+                        FunctionRoundingImpl<ScaleMode::Positive>::apply(col->get_data()[i], scale,
+                                                                         vec_res[i]);
+                    }
                 } else {
-                    size_t scale = int_exp10(-scale_arg);
-                    FunctionRoundingImpl<ScaleMode::Negative>::apply(col->get_data()[i], scale,
-                                                                     vec_res[i]);
+                    if constexpr (is_float_or_double(T)) {
+                        if (scale_arg < -19) {
+                            vec_res[i] = apply_float_rounding_with_large_scale(col->get_data()[i],
+                                                                               scale_arg);
+                        } else {
+                            size_t scale = int_exp10(-scale_arg);
+                            FunctionRoundingImpl<ScaleMode::Negative>::apply(col->get_data()[i],
+                                                                             scale, vec_res[i]);
+                        }
+                    } else {
+                        size_t scale = int_exp10(-scale_arg);
+                        FunctionRoundingImpl<ScaleMode::Negative>::apply(col->get_data()[i], scale,
+                                                                         vec_res[i]);
+                    }
                 }
             }
             return col_res;
@@ -670,13 +825,35 @@ struct Dispatcher {
                     size_t scale = 1;
                     FunctionRoundingImpl<ScaleMode::Zero>::apply(general_val, scale, vec_res[i]);
                 } else if (scale_arg > 0) {
-                    size_t scale = int_exp10(col_scale_i32.get_data()[i]);
-                    FunctionRoundingImpl<ScaleMode::Positive>::apply(general_val, scale,
-                                                                     vec_res[i]);
+                    if constexpr (is_float_or_double(T)) {
+                        if (scale_arg > 19) {
+                            vec_res[i] =
+                                    apply_float_rounding_with_large_scale(general_val, scale_arg);
+                        } else {
+                            size_t scale = int_exp10(scale_arg);
+                            FunctionRoundingImpl<ScaleMode::Positive>::apply(general_val, scale,
+                                                                             vec_res[i]);
+                        }
+                    } else {
+                        size_t scale = int_exp10(scale_arg);
+                        FunctionRoundingImpl<ScaleMode::Positive>::apply(general_val, scale,
+                                                                         vec_res[i]);
+                    }
                 } else {
-                    size_t scale = int_exp10(-col_scale_i32.get_data()[i]);
-                    FunctionRoundingImpl<ScaleMode::Negative>::apply(general_val, scale,
-                                                                     vec_res[i]);
+                    if constexpr (is_float_or_double(T)) {
+                        if (scale_arg < -19) {
+                            vec_res[i] =
+                                    apply_float_rounding_with_large_scale(general_val, scale_arg);
+                        } else {
+                            size_t scale = int_exp10(-scale_arg);
+                            FunctionRoundingImpl<ScaleMode::Negative>::apply(general_val, scale,
+                                                                             vec_res[i]);
+                        }
+                    } else {
+                        size_t scale = int_exp10(-scale_arg);
+                        FunctionRoundingImpl<ScaleMode::Negative>::apply(general_val, scale,
+                                                                         vec_res[i]);
+                    }
                 }
             }
 
